@@ -10,6 +10,17 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Tuple
 import json
+import requests
+
+
+# Fix for Streamlit Cloud - set headers to avoid blocking
+yf.pdr_override()
+
+# Monkey-patch to add headers (helps avoid Yahoo blocking cloud IPs)
+import yfinance.data as _yf_data
+_yf_data.YfData.user_agent_headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+}
 
 
 class DataFetcher:
@@ -22,11 +33,18 @@ class DataFetcher:
         Args:
             ticker: Stock ticker symbol (e.g., 'AAPL')
         """
-        self.ticker = ticker.upper()
-        self.stock = yf.Ticker(self.ticker)
+        self.ticker = ticker.upper().strip()
+        self._stock = None
         self._info: Optional[Dict] = None
         self._history: Optional[pd.DataFrame] = None
         self._financials: Optional[Dict] = None
+
+    @property
+    def stock(self):
+        """Lazy load the yfinance Ticker object."""
+        if self._stock is None:
+            self._stock = yf.Ticker(self.ticker)
+        return self._stock
 
     def get_stock_info(self) -> Dict[str, Any]:
         """
@@ -38,9 +56,29 @@ class DataFetcher:
         if self._info is None:
             try:
                 self._info = self.stock.info
+                # Check if we got valid data
+                if not self._info or self._info.get('regularMarketPrice') is None:
+                    # Try a backup approach
+                    self._info = self._fetch_info_backup()
             except Exception as e:
+                print(f"Error fetching stock info: {e}")
                 self._info = {"error": str(e)}
         return self._info
+
+    def _fetch_info_backup(self) -> Dict[str, Any]:
+        """Backup method to fetch basic info if main method fails."""
+        try:
+            # Try to at least get price data
+            hist = self.stock.history(period="5d")
+            if not hist.empty:
+                return {
+                    "regularMarketPrice": hist['Close'].iloc[-1],
+                    "symbol": self.ticker,
+                    "shortName": self.ticker,
+                }
+        except:
+            pass
+        return {"error": "Could not fetch stock info"}
 
     def get_price_history(
         self, period: str = "1y", interval: str = "1d"
@@ -57,12 +95,30 @@ class DataFetcher:
         """
         if self._history is None or self._history.empty:
             try:
+                # Method 1: Standard approach
                 self._history = self.stock.history(period=period, interval=interval)
+                
+                # If empty, try download method
+                if self._history.empty:
+                    self._history = yf.download(
+                        self.ticker, 
+                        period=period, 
+                        interval=interval,
+                        progress=False,
+                        auto_adjust=True
+                    )
+                
                 # Reset index to make Date a column
-                self._history = self._history.reset_index()
+                if not self._history.empty:
+                    self._history = self._history.reset_index()
+                    # Ensure column name is 'Date'
+                    if 'Datetime' in self._history.columns:
+                        self._history = self._history.rename(columns={'Datetime': 'Date'})
+                        
             except Exception as e:
-                self._history = pd.DataFrame()
                 print(f"Error fetching price history: {e}")
+                self._history = pd.DataFrame()
+                
         return self._history
 
     def get_financial_data(self) -> Dict[str, Any]:
@@ -220,7 +276,7 @@ class DataFetcher:
         
         lines = [
             f"Financial Data for {self.ticker}",
-            f"Company: {info.get('longName', 'N/A')}",
+            f"Company: {info.get('longName', info.get('shortName', 'N/A'))}",
             f"Sector: {info.get('sector', 'N/A')}",
             f"Industry: {info.get('industry', 'N/A')}",
             "",
@@ -500,3 +556,4 @@ class DataFetcher:
             return float(revenue) < threshold
         except (TypeError, ValueError):
             return True
+
