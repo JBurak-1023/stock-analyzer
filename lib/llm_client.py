@@ -3,11 +3,12 @@ LLM Client Module
 
 Handles all interactions with the Claude API, including
 web search-enabled calls for qualitative analysis.
+
+Includes rate limit handling and output truncation for efficiency.
 """
 
 import anthropic
-from typing import Optional, Dict, Any, List, Generator
-import json
+from typing import Optional, Dict, Any, List
 import time
 import sys
 from pathlib import Path
@@ -26,6 +27,33 @@ from prompts.prompts import (
 )
 
 
+def truncate_text(text: str, max_chars: int = 4000) -> str:
+    """
+    Truncate text to a maximum character length, preserving complete sentences.
+    
+    Args:
+        text: Text to truncate
+        max_chars: Maximum characters to keep
+        
+    Returns:
+        Truncated text with indicator if truncated
+    """
+    if len(text) <= max_chars:
+        return text
+    
+    # Find a good break point (end of sentence)
+    truncated = text[:max_chars]
+    
+    # Try to break at sentence end
+    for end_char in ['. ', '.\n', '! ', '?\n']:
+        last_period = truncated.rfind(end_char)
+        if last_period > max_chars * 0.7:  # Only if we keep at least 70%
+            truncated = truncated[:last_period + 1]
+            break
+    
+    return truncated + "\n\n[... output truncated for efficiency ...]"
+
+
 class LLMClient:
     """Client for Claude API interactions with web search support."""
 
@@ -39,18 +67,19 @@ class LLMClient:
         """
         self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
-        self.max_retries = 3
-        self.retry_delay = 2  # seconds
+        self.max_retries = 5
+        self.base_delay = 5  # Base delay between calls in seconds
+        self.rate_limit_delay = 65  # Wait time when rate limited (just over 1 minute)
 
     def _call_api(
         self,
         prompt: str,
         use_web_search: bool = False,
-        max_tokens: int = 4096,
+        max_tokens: int = 2048,
         temperature: float = 0.3,
     ) -> str:
         """
-        Make an API call to Claude.
+        Make an API call to Claude with rate limit handling.
         
         Args:
             prompt: The prompt to send
@@ -76,11 +105,11 @@ class LLMClient:
                 {
                     "type": "web_search_20250305",
                     "name": "web_search",
-                    "max_uses": 10,
+                    "max_uses": 5,  # Reduced from 10 to limit token usage
                 }
             ]
         
-        # Retry logic
+        # Retry logic with exponential backoff
         last_error = None
         for attempt in range(self.max_retries):
             try:
@@ -97,109 +126,62 @@ class LLMClient:
             except anthropic.RateLimitError as e:
                 last_error = e
                 if attempt < self.max_retries - 1:
-                    time.sleep(self.retry_delay * (attempt + 1))
+                    # Wait longer for rate limits - need to wait for the minute to reset
+                    wait_time = self.rate_limit_delay
+                    print(f"Rate limited. Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
                 continue
             except anthropic.APIError as e:
                 last_error = e
                 if attempt < self.max_retries - 1:
-                    time.sleep(self.retry_delay)
+                    wait_time = self.base_delay * (2 ** attempt)
+                    print(f"API error. Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
                 continue
         
         raise last_error or Exception("API call failed after retries")
 
     def analyze_company_overview(self, ticker: str, company_name: str) -> str:
-        """
-        Get company overview using web search.
-        
-        Args:
-            ticker: Stock ticker symbol
-            company_name: Full company name
-            
-        Returns:
-            Company overview analysis text
-        """
+        """Get company overview using web search."""
         prompt = get_company_overview_prompt(ticker, company_name)
-        return self._call_api(prompt, use_web_search=True)
+        return self._call_api(prompt, use_web_search=True, max_tokens=1500)
 
     def analyze_financials(
         self, ticker: str, company_name: str, financial_data: str
     ) -> str:
-        """
-        Analyze financial data.
-        
-        Args:
-            ticker: Stock ticker symbol
-            company_name: Full company name
-            financial_data: Formatted financial data string
-            
-        Returns:
-            Financial analysis text
-        """
+        """Analyze financial data."""
+        # Truncate financial data if too long
+        financial_data = truncate_text(financial_data, max_chars=6000)
         prompt = get_financial_analysis_prompt(ticker, company_name, financial_data)
-        return self._call_api(prompt, use_web_search=False)
+        return self._call_api(prompt, use_web_search=False, max_tokens=1500)
 
     def analyze_competitive_positioning(self, ticker: str, company_name: str) -> str:
-        """
-        Analyze competitive landscape using web search.
-        
-        Args:
-            ticker: Stock ticker symbol
-            company_name: Full company name
-            
-        Returns:
-            Competitive analysis text
-        """
+        """Analyze competitive landscape using web search."""
         prompt = get_competitive_positioning_prompt(ticker, company_name)
-        return self._call_api(prompt, use_web_search=True)
+        return self._call_api(prompt, use_web_search=True, max_tokens=1500)
 
     def analyze_sentiment(self, ticker: str, company_name: str) -> str:
-        """
-        Analyze news and sentiment using web search.
-        
-        Args:
-            ticker: Stock ticker symbol
-            company_name: Full company name
-            
-        Returns:
-            Sentiment analysis text
-        """
+        """Analyze news and sentiment using web search."""
         prompt = get_sentiment_analysis_prompt(ticker, company_name)
-        return self._call_api(prompt, use_web_search=True)
+        return self._call_api(prompt, use_web_search=True, max_tokens=1500)
 
     def analyze_technicals(
         self, ticker: str, company_name: str, price_data: str
     ) -> str:
-        """
-        Perform technical analysis and assign grade.
-        
-        Args:
-            ticker: Stock ticker symbol
-            company_name: Full company name
-            price_data: Formatted price/volume data string
-            
-        Returns:
-            Technical analysis text with grade
-        """
+        """Perform technical analysis and assign grade."""
+        # Truncate price data if too long
+        price_data = truncate_text(price_data, max_chars=4000)
         prompt = get_technical_analysis_prompt(ticker, company_name, price_data)
-        return self._call_api(prompt, use_web_search=False)
+        return self._call_api(prompt, use_web_search=False, max_tokens=1500)
 
     def analyze_supplemental(
         self, ticker: str, company_name: str, source_name: str, content: str
     ) -> str:
-        """
-        Analyze supplemental material (uploaded file content).
-        
-        Args:
-            ticker: Stock ticker symbol
-            company_name: Full company name
-            source_name: Name/path of the uploaded file
-            content: Extracted content from the file
-            
-        Returns:
-            Supplemental analysis text
-        """
+        """Analyze supplemental material (uploaded file content)."""
+        # Truncate content if too long
+        content = truncate_text(content, max_chars=5000)
         prompt = get_supplemental_analysis_prompt(ticker, company_name, source_name, content)
-        return self._call_api(prompt, use_web_search=False)
+        return self._call_api(prompt, use_web_search=False, max_tokens=1000)
 
     def analyze_supplemental_image(
         self,
@@ -209,19 +191,7 @@ class LLMClient:
         image_data: bytes,
         media_type: str = "image/png",
     ) -> str:
-        """
-        Analyze an uploaded image (e.g., chart screenshot).
-        
-        Args:
-            ticker: Stock ticker symbol
-            company_name: Full company name
-            source_name: Name of the image file
-            image_data: Raw image bytes
-            media_type: MIME type of the image
-            
-        Returns:
-            Analysis of the image content
-        """
+        """Analyze an uploaded image (e.g., chart screenshot)."""
         import base64
         
         # Encode image to base64
@@ -233,16 +203,9 @@ Source: {source_name}
 
 This image was provided as additional context for an investment analysis. Please analyze what you see and extract:
 
-1. **Image Type & Content**
-   - What does this image show? (chart, screenshot, data visualization, etc.)
-   - What key information is visible?
-
-2. **Key Takeaways**
-   - What are the most important insights from this image relevant to an investment thesis?
-   - Any notable patterns, levels, or data points?
-
-3. **Thesis Impact**
-   - Does this image support a bullish case, bearish case, or is it neutral?
+1. **Image Type & Content** - What does this image show?
+2. **Key Takeaways** - Most important insights relevant to an investment thesis
+3. **Thesis Impact** - Does this support a bullish case, bearish case, or neutral?
 
 Be concise and focus on actionable insights."""
 
@@ -263,18 +226,27 @@ Be concise and focus on actionable insights."""
             }
         ]
         
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=2048,
-            messages=messages,
-        )
+        for attempt in range(self.max_retries):
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1000,
+                    messages=messages,
+                )
+                
+                text_parts = []
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        text_parts.append(block.text)
+                
+                return "\n".join(text_parts)
+            except anthropic.RateLimitError:
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.rate_limit_delay)
+                    continue
+                raise
         
-        text_parts = []
-        for block in response.content:
-            if hasattr(block, "text"):
-                text_parts.append(block.text)
-        
-        return "\n".join(text_parts)
+        return "[Image analysis failed]"
 
     def synthesize_report(
         self,
@@ -287,22 +259,16 @@ Be concise and focus on actionable insights."""
         ta_output: str,
         supplemental_output: str = "No supplemental materials provided.",
     ) -> str:
-        """
-        Synthesize all analyses into a final report.
+        """Synthesize all analyses into a final report."""
         
-        Args:
-            ticker: Stock ticker symbol
-            company_name: Full company name
-            overview_output: Output from company overview analysis
-            financial_output: Output from financial analysis
-            competitive_output: Output from competitive analysis
-            sentiment_output: Output from sentiment analysis
-            ta_output: Output from technical analysis
-            supplemental_output: Combined output from supplemental analyses
-            
-        Returns:
-            Final synthesized report text
-        """
+        # Truncate all inputs to keep synthesis prompt manageable
+        overview_output = truncate_text(overview_output, max_chars=3000)
+        financial_output = truncate_text(financial_output, max_chars=3000)
+        competitive_output = truncate_text(competitive_output, max_chars=2500)
+        sentiment_output = truncate_text(sentiment_output, max_chars=2500)
+        ta_output = truncate_text(ta_output, max_chars=2500)
+        supplemental_output = truncate_text(supplemental_output, max_chars=2000)
+        
         prompt = get_synthesis_prompt(
             ticker=ticker,
             company_name=company_name,
@@ -314,7 +280,7 @@ Be concise and focus on actionable insights."""
             supplemental_output=supplemental_output,
         )
         
-        return self._call_api(prompt, use_web_search=False, max_tokens=8192)
+        return self._call_api(prompt, use_web_search=False, max_tokens=4000)
 
     def run_full_analysis(
         self,
@@ -326,7 +292,7 @@ Be concise and focus on actionable insights."""
         progress_callback: Optional[callable] = None,
     ) -> Dict[str, str]:
         """
-        Run the complete analysis pipeline.
+        Run the complete analysis pipeline with rate limit handling.
         
         Args:
             ticker: Stock ticker symbol
@@ -340,27 +306,34 @@ Be concise and focus on actionable insights."""
             Dictionary with all analysis outputs and final report
         """
         results = {}
+        
+        # Define steps with delays between them to avoid rate limits
+        # Delay is in seconds - spread calls over multiple minutes
         steps = [
             ("overview", "Analyzing company overview...", 
-             lambda: self.analyze_company_overview(ticker, company_name)),
+             lambda: self.analyze_company_overview(ticker, company_name), 15),
             ("financials", "Analyzing financials...", 
-             lambda: self.analyze_financials(ticker, company_name, financial_data)),
+             lambda: self.analyze_financials(ticker, company_name, financial_data), 10),
             ("competitive", "Analyzing competitive positioning...", 
-             lambda: self.analyze_competitive_positioning(ticker, company_name)),
+             lambda: self.analyze_competitive_positioning(ticker, company_name), 15),
             ("sentiment", "Analyzing news and sentiment...", 
-             lambda: self.analyze_sentiment(ticker, company_name)),
+             lambda: self.analyze_sentiment(ticker, company_name), 15),
             ("technical", "Performing technical analysis...", 
-             lambda: self.analyze_technicals(ticker, company_name, price_data)),
+             lambda: self.analyze_technicals(ticker, company_name, price_data), 10),
         ]
         
-        # Run main analyses
-        for key, message, func in steps:
+        # Run main analyses with delays between each
+        for i, (key, message, func, delay) in enumerate(steps):
             if progress_callback:
                 progress_callback(message)
             try:
                 results[key] = func()
             except Exception as e:
                 results[key] = f"[Analysis failed: {str(e)}]"
+            
+            # Add delay before next call (except after last one)
+            if i < len(steps) - 1:
+                time.sleep(delay)
         
         # Process supplemental materials
         supplemental_outputs = []
@@ -386,9 +359,18 @@ Be concise and focus on actionable insights."""
                     supplemental_outputs.append(f"### {item['name']}\n{output}")
                 except Exception as e:
                     supplemental_outputs.append(f"### {item['name']}\n[Analysis failed: {str(e)}]")
+                
+                # Delay between supplemental files
+                if i < len(supplemental_contents) - 1:
+                    time.sleep(10)
         
         supplemental_combined = "\n\n".join(supplemental_outputs) if supplemental_outputs else "No supplemental materials provided."
         results["supplemental"] = supplemental_combined
+        
+        # Wait before synthesis to ensure rate limit window resets
+        if progress_callback:
+            progress_callback("Preparing final synthesis (waiting for rate limit reset)...")
+        time.sleep(20)
         
         # Synthesize final report
         if progress_callback:
