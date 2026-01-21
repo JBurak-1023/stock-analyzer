@@ -2,26 +2,18 @@
 Data Fetcher Module
 
 Wraps yfinance to fetch price history, volume, and financial data.
-Includes error handling and data formatting for downstream use.
 """
 
 import yfinance as yf
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, Dict, Any
-import requests
 
 
 class DataFetcher:
     """Fetches stock data from Yahoo Finance via yfinance."""
 
     def __init__(self, ticker: str):
-        """
-        Initialize the data fetcher with a ticker symbol.
-        
-        Args:
-            ticker: Stock ticker symbol (e.g., 'AAPL')
-        """
         self.ticker = ticker.upper().strip()
         self._stock = None
         self._info: Optional[Dict] = None
@@ -30,59 +22,23 @@ class DataFetcher:
 
     @property
     def stock(self):
-        """Lazy load the yfinance Ticker object."""
         if self._stock is None:
             self._stock = yf.Ticker(self.ticker)
         return self._stock
 
     def get_stock_info(self) -> Dict[str, Any]:
-        """
-        Get basic stock information.
-        
-        Returns:
-            Dictionary with stock info (name, sector, industry, etc.)
-        """
         if self._info is None:
             try:
                 self._info = self.stock.info
-                # Check if we got valid data
                 if not self._info or len(self._info) < 5:
-                    self._info = self._fetch_info_backup()
+                    self._info = {"symbol": self.ticker, "shortName": self.ticker}
             except Exception as e:
-                print(f"Error fetching stock info: {e}")
                 self._info = {"error": str(e), "symbol": self.ticker}
         return self._info
 
-    def _fetch_info_backup(self) -> Dict[str, Any]:
-        """Backup method to fetch basic info if main method fails."""
-        try:
-            hist = self.stock.history(period="5d")
-            if not hist.empty:
-                return {
-                    "regularMarketPrice": hist['Close'].iloc[-1],
-                    "symbol": self.ticker,
-                    "shortName": self.ticker,
-                }
-        except:
-            pass
-        return {"error": "Could not fetch stock info", "symbol": self.ticker}
-
-    def get_price_history(
-        self, period: str = "1y", interval: str = "1d"
-    ) -> pd.DataFrame:
-        """
-        Fetch historical price and volume data.
-        
-        Args:
-            period: Time period ('6mo', '1y', '2y', '5y', 'max')
-            interval: Data interval ('1d', '1wk', '1mo')
-            
-        Returns:
-            DataFrame with OHLCV data
-        """
+    def get_price_history(self, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
         if self._history is None or self._history.empty:
             try:
-                # Try download method first (more reliable on cloud)
                 self._history = yf.download(
                     self.ticker, 
                     period=period, 
@@ -91,16 +47,17 @@ class DataFetcher:
                     auto_adjust=True
                 )
                 
-                # If empty, try the Ticker.history method
                 if self._history.empty:
                     self._history = self.stock.history(period=period, interval=interval)
                 
-                # Reset index to make Date a column
                 if not self._history.empty:
                     self._history = self._history.reset_index()
-                    # Ensure column name is 'Date'
                     if 'Datetime' in self._history.columns:
                         self._history = self._history.rename(columns={'Datetime': 'Date'})
+                    
+                    # Flatten column names if MultiIndex (happens with yf.download)
+                    if isinstance(self._history.columns, pd.MultiIndex):
+                        self._history.columns = [col[0] if isinstance(col, tuple) else col for col in self._history.columns]
                         
             except Exception as e:
                 print(f"Error fetching price history: {e}")
@@ -109,13 +66,6 @@ class DataFetcher:
         return self._history
 
     def get_financial_data(self) -> Dict[str, Any]:
-        """
-        Fetch financial statements and key metrics.
-        
-        Returns:
-            Dictionary containing income statement, balance sheet, 
-            cash flow, and key ratios
-        """
         if self._financials is not None:
             return self._financials
 
@@ -129,7 +79,6 @@ class DataFetcher:
         try:
             info = self.get_stock_info()
             
-            # Key metrics from info
             financials["key_metrics"] = {
                 "market_cap": info.get("marketCap"),
                 "enterprise_value": info.get("enterpriseValue"),
@@ -163,13 +112,8 @@ class DataFetcher:
                 "52_week_low": info.get("fiftyTwoWeekLow"),
                 "50_day_average": info.get("fiftyDayAverage"),
                 "200_day_average": info.get("twoHundredDayAverage"),
-                "shares_outstanding": info.get("sharesOutstanding"),
-                "float_shares": info.get("floatShares"),
-                "shares_short": info.get("sharesShort"),
-                "short_ratio": info.get("shortRatio"),
             }
 
-            # Income statement
             try:
                 income_stmt = self.stock.income_stmt
                 if income_stmt is not None and not income_stmt.empty:
@@ -179,45 +123,35 @@ class DataFetcher:
                         "gross_profit": self._safe_get(latest, "Gross Profit"),
                         "operating_income": self._safe_get(latest, "Operating Income"),
                         "net_income": self._safe_get(latest, "Net Income"),
-                        "ebitda": self._safe_get(latest, "EBITDA"),
                     }
-                    financials["income_statement"]["historical_revenue"] = self._get_historical_series(
-                        income_stmt, "Total Revenue"
-                    )
-            except Exception as e:
-                financials["income_statement"]["error"] = str(e)
+            except:
+                pass
 
-            # Balance sheet
             try:
                 balance = self.stock.balance_sheet
                 if balance is not None and not balance.empty:
                     latest = balance.iloc[:, 0]
                     financials["balance_sheet"] = {
                         "total_assets": self._safe_get(latest, "Total Assets"),
-                        "total_liabilities": self._safe_get(latest, "Total Liabilities Net Minority Interest"),
                         "total_equity": self._safe_get(latest, "Stockholders Equity"),
                         "current_assets": self._safe_get(latest, "Current Assets"),
                         "current_liabilities": self._safe_get(latest, "Current Liabilities"),
                         "cash_and_equivalents": self._safe_get(latest, "Cash And Cash Equivalents"),
                         "total_debt": self._safe_get(latest, "Total Debt"),
-                        "long_term_debt": self._safe_get(latest, "Long Term Debt"),
                     }
-            except Exception as e:
-                financials["balance_sheet"]["error"] = str(e)
+            except:
+                pass
 
-            # Cash flow
             try:
                 cashflow = self.stock.cashflow
                 if cashflow is not None and not cashflow.empty:
                     latest = cashflow.iloc[:, 0]
                     financials["cash_flow"] = {
                         "operating_cash_flow": self._safe_get(latest, "Operating Cash Flow"),
-                        "capital_expenditure": self._safe_get(latest, "Capital Expenditure"),
                         "free_cash_flow": self._safe_get(latest, "Free Cash Flow"),
-                        "dividends_paid": self._safe_get(latest, "Cash Dividends Paid"),
                     }
-            except Exception as e:
-                financials["cash_flow"]["error"] = str(e)
+            except:
+                pass
 
         except Exception as e:
             financials["error"] = str(e)
@@ -226,33 +160,49 @@ class DataFetcher:
         return financials
 
     def _safe_get(self, series: pd.Series, key: str) -> Optional[float]:
-        """Safely get a value from a pandas Series."""
         try:
             value = series.get(key)
-            if pd.isna(value):
+            if value is None or pd.isna(value):
                 return None
             return float(value)
-        except (KeyError, TypeError, ValueError):
+        except:
             return None
 
-    def _get_historical_series(self, df: pd.DataFrame, row_name: str) -> Dict[str, float]:
-        """Extract historical values for a given metric."""
-        result = {}
-        try:
-            if row_name in df.index:
-                for col in df.columns:
-                    date_str = col.strftime("%Y-%m-%d") if hasattr(col, "strftime") else str(col)
-                    value = df.loc[row_name, col]
-                    if not pd.isna(value):
-                        result[date_str] = float(value)
-        except Exception:
-            pass
-        return result
-
     def format_financial_data_for_llm(self) -> str:
-        """Format financial data as a string for LLM consumption."""
         data = self.get_financial_data()
         info = self.get_stock_info()
+        
+        def fmt_num(val, prefix=""):
+            if val is None:
+                return "N/A"
+            try:
+                num = float(val)
+                if abs(num) >= 1e9:
+                    return f"{prefix}{num/1e9:.2f}B"
+                elif abs(num) >= 1e6:
+                    return f"{prefix}{num/1e6:.2f}M"
+                else:
+                    return f"{prefix}{num:.2f}"
+            except:
+                return "N/A"
+
+        def fmt_pct(val):
+            if val is None:
+                return "N/A"
+            try:
+                return f"{float(val) * 100:.2f}%"
+            except:
+                return "N/A"
+
+        def fmt_ratio(val):
+            if val is None:
+                return "N/A"
+            try:
+                return f"{float(val):.2f}"
+            except:
+                return "N/A"
+
+        metrics = data.get("key_metrics", {})
         
         lines = [
             f"Financial Data for {self.ticker}",
@@ -261,47 +211,9 @@ class DataFetcher:
             f"Industry: {info.get('industry', 'N/A')}",
             "",
             "=== KEY METRICS ===",
-        ]
-
-        metrics = data.get("key_metrics", {})
-        
-        def fmt_num(val, prefix="", suffix="", divisor=1):
-            if val is None:
-                return "N/A"
-            try:
-                num = float(val) / divisor
-                if abs(num) >= 1e9:
-                    return f"{prefix}{num/1e9:.2f}B{suffix}"
-                elif abs(num) >= 1e6:
-                    return f"{prefix}{num/1e6:.2f}M{suffix}"
-                elif abs(num) >= 1e3:
-                    return f"{prefix}{num/1e3:.2f}K{suffix}"
-                else:
-                    return f"{prefix}{num:.2f}{suffix}"
-            except (TypeError, ValueError):
-                return "N/A"
-
-        def fmt_pct(val):
-            if val is None:
-                return "N/A"
-            try:
-                return f"{float(val) * 100:.2f}%"
-            except (TypeError, ValueError):
-                return "N/A"
-
-        def fmt_ratio(val):
-            if val is None:
-                return "N/A"
-            try:
-                return f"{float(val):.2f}"
-            except (TypeError, ValueError):
-                return "N/A"
-
-        lines.extend([
-            f"Market Cap: {fmt_num(metrics.get('market_cap'), prefix='$')}",
-            f"Enterprise Value: {fmt_num(metrics.get('enterprise_value'), prefix='$')}",
-            f"Total Revenue (TTM): {fmt_num(metrics.get('total_revenue'), prefix='$')}",
-            f"Revenue Growth (YoY): {fmt_pct(metrics.get('revenue_growth'))}",
+            f"Market Cap: {fmt_num(metrics.get('market_cap'), '$')}",
+            f"Revenue (TTM): {fmt_num(metrics.get('total_revenue'), '$')}",
+            f"Revenue Growth: {fmt_pct(metrics.get('revenue_growth'))}",
             "",
             "=== VALUATION ===",
             f"P/E (Trailing): {fmt_ratio(metrics.get('trailing_pe'))}",
@@ -309,104 +221,124 @@ class DataFetcher:
             f"PEG Ratio: {fmt_ratio(metrics.get('peg_ratio'))}",
             f"Price/Book: {fmt_ratio(metrics.get('price_to_book'))}",
             f"Price/Sales: {fmt_ratio(metrics.get('price_to_sales'))}",
-            f"EV/Revenue: {fmt_ratio(metrics.get('enterprise_to_revenue'))}",
-            f"EV/EBITDA: {fmt_ratio(metrics.get('enterprise_to_ebitda'))}",
             "",
             "=== PROFITABILITY ===",
             f"Gross Margin: {fmt_pct(metrics.get('gross_margins'))}",
             f"Operating Margin: {fmt_pct(metrics.get('operating_margins'))}",
             f"Profit Margin: {fmt_pct(metrics.get('profit_margins'))}",
-            f"Return on Equity: {fmt_pct(metrics.get('return_on_equity'))}",
-            f"Return on Assets: {fmt_pct(metrics.get('return_on_assets'))}",
+            f"ROE: {fmt_pct(metrics.get('return_on_equity'))}",
             "",
             "=== BALANCE SHEET ===",
-            f"Total Cash: {fmt_num(metrics.get('total_cash'), prefix='$')}",
-            f"Total Debt: {fmt_num(metrics.get('total_debt'), prefix='$')}",
+            f"Total Cash: {fmt_num(metrics.get('total_cash'), '$')}",
+            f"Total Debt: {fmt_num(metrics.get('total_debt'), '$')}",
             f"Debt/Equity: {fmt_ratio(metrics.get('debt_to_equity'))}",
             f"Current Ratio: {fmt_ratio(metrics.get('current_ratio'))}",
-            f"Quick Ratio: {fmt_ratio(metrics.get('quick_ratio'))}",
             "",
             "=== CASH FLOW ===",
-            f"Operating Cash Flow: {fmt_num(metrics.get('operating_cash_flow'), prefix='$')}",
-            f"Free Cash Flow: {fmt_num(metrics.get('free_cash_flow'), prefix='$')}",
+            f"Operating Cash Flow: {fmt_num(metrics.get('operating_cash_flow'), '$')}",
+            f"Free Cash Flow: {fmt_num(metrics.get('free_cash_flow'), '$')}",
             "",
-            "=== TRADING INFO ===",
-            f"52-Week High: {fmt_num(metrics.get('52_week_high'), prefix='$')}",
-            f"52-Week Low: {fmt_num(metrics.get('52_week_low'), prefix='$')}",
-            f"50-Day Average: {fmt_num(metrics.get('50_day_average'), prefix='$')}",
-            f"200-Day Average: {fmt_num(metrics.get('200_day_average'), prefix='$')}",
+            "=== TRADING ===",
+            f"52-Week High: {fmt_num(metrics.get('52_week_high'), '$')}",
+            f"52-Week Low: {fmt_num(metrics.get('52_week_low'), '$')}",
+            f"50-Day Avg: {fmt_num(metrics.get('50_day_average'), '$')}",
+            f"200-Day Avg: {fmt_num(metrics.get('200_day_average'), '$')}",
             f"Beta: {fmt_ratio(metrics.get('beta'))}",
-            "",
-            "=== DIVIDENDS ===",
-            f"Dividend Yield: {fmt_pct(metrics.get('dividend_yield'))}",
-            f"Payout Ratio: {fmt_pct(metrics.get('payout_ratio'))}",
-        ])
+        ]
 
         return "\n".join(lines)
 
     def format_price_data_for_llm(self, days: int = 60) -> str:
-        """Format recent price/volume data for LLM technical analysis."""
         df = self.get_price_history()
         
         if df.empty:
             return "Price data unavailable."
         
+        # Ensure we have the right columns
+        required_cols = ['Close', 'High', 'Low', 'Volume']
+        for col in required_cols:
+            if col not in df.columns:
+                return f"Price data missing column: {col}"
+        
         # Calculate moving averages
-        df["MA50"] = df["Close"].rolling(window=50).mean()
-        df["MA200"] = df["Close"].rolling(window=200).mean()
-        df["Avg_Volume"] = df["Volume"].rolling(window=50).mean()
+        df = df.copy()
+        df["MA50"] = df["Close"].rolling(window=50, min_periods=1).mean()
+        df["MA200"] = df["Close"].rolling(window=200, min_periods=1).mean()
         
         recent = df.tail(days).copy()
         
+        if recent.empty:
+            return "No recent price data available."
+        
         lines = [
-            f"Price and Volume Data for {self.ticker}",
+            f"Price Data for {self.ticker}",
             f"Period: Last {len(recent)} trading days",
             "",
             "=== CURRENT STATUS ===",
         ]
         
-        if not recent.empty:
-            latest = recent.iloc[-1]
-            prev = recent.iloc[-2] if len(recent) > 1 else latest
-            
-            current_price = latest["Close"]
-            prev_close = prev["Close"]
-            change = current_price - prev_close
-            change_pct = (change / prev_close) * 100 if prev_close else 0
-            
-            lines.extend([
-                f"Current Price: ${current_price:.2f}",
-                f"Previous Close: ${prev_close:.2f}",
-                f"Change: ${change:.2f} ({change_pct:+.2f}%)",
-                "",
-                "=== MOVING AVERAGES ===",
-                f"50-Day MA: ${latest['MA50']:.2f}" if pd.notna(latest.get('MA50')) else "50-Day MA: N/A",
-                f"200-Day MA: ${latest['MA200']:.2f}" if pd.notna(latest.get('MA200')) else "200-Day MA: N/A",
-            ])
-            
-            if pd.notna(latest.get('MA50')):
-                pct_from_50 = ((current_price - latest['MA50']) / latest['MA50']) * 100
-                lines.append(f"Price vs 50-MA: {pct_from_50:+.2f}%")
-            if pd.notna(latest.get('MA200')):
-                pct_from_200 = ((current_price - latest['MA200']) / latest['MA200']) * 100
-                lines.append(f"Price vs 200-MA: {pct_from_200:+.2f}%")
+        # Get latest values safely
+        latest = recent.iloc[-1]
+        current_price = float(latest["Close"])
         
+        if len(recent) > 1:
+            prev = recent.iloc[-2]
+            prev_close = float(prev["Close"])
+            change = current_price - prev_close
+            change_pct = (change / prev_close) * 100 if prev_close != 0 else 0
+        else:
+            prev_close = current_price
+            change = 0
+            change_pct = 0
+        
+        lines.extend([
+            f"Current Price: ${current_price:.2f}",
+            f"Previous Close: ${prev_close:.2f}",
+            f"Change: ${change:.2f} ({change_pct:+.2f}%)",
+        ])
+        
+        # Moving averages
+        ma50 = latest.get("MA50")
+        ma200 = latest.get("MA200")
+        
+        lines.append("")
+        lines.append("=== MOVING AVERAGES ===")
+        
+        if ma50 is not None and not pd.isna(ma50):
+            ma50_val = float(ma50)
+            lines.append(f"50-Day MA: ${ma50_val:.2f}")
+            pct_from_50 = ((current_price - ma50_val) / ma50_val) * 100
+            lines.append(f"Price vs 50-MA: {pct_from_50:+.2f}%")
+        else:
+            lines.append("50-Day MA: N/A")
+            
+        if ma200 is not None and not pd.isna(ma200):
+            ma200_val = float(ma200)
+            lines.append(f"200-Day MA: ${ma200_val:.2f}")
+            pct_from_200 = ((current_price - ma200_val) / ma200_val) * 100
+            lines.append(f"Price vs 200-MA: {pct_from_200:+.2f}%")
+        else:
+            lines.append("200-Day MA: N/A")
+        
+        # Period stats
         lines.extend([
             "",
             "=== PERIOD STATISTICS ===",
-            f"Period High: ${recent['High'].max():.2f}",
-            f"Period Low: ${recent['Low'].min():.2f}",
+            f"Period High: ${float(recent['High'].max()):.2f}",
+            f"Period Low: ${float(recent['Low'].min()):.2f}",
             f"Average Volume: {int(recent['Volume'].mean()):,}",
         ])
         
-        # Last 20 days summary
-        last_20 = recent.tail(20)
-        if len(last_20) >= 2:
-            start_price = last_20.iloc[0]["Close"]
-            end_price = last_20.iloc[-1]["Close"]
-            period_return = ((end_price - start_price) / start_price) * 100
-            up_days = (last_20["Close"].diff() > 0).sum()
-            down_days = (last_20["Close"].diff() < 0).sum()
+        # Recent trend
+        if len(recent) >= 20:
+            last_20 = recent.tail(20)
+            start_price = float(last_20.iloc[0]["Close"])
+            end_price = float(last_20.iloc[-1]["Close"])
+            period_return = ((end_price - start_price) / start_price) * 100 if start_price != 0 else 0
+            
+            closes = last_20["Close"].diff()
+            up_days = int((closes > 0).sum())
+            down_days = int((closes < 0).sum())
             
             lines.extend([
                 "",
@@ -419,7 +351,6 @@ class DataFetcher:
         return "\n".join(lines)
 
     def is_pre_revenue(self, threshold: float = 1_000_000) -> bool:
-        """Check if company is pre-revenue or early-stage."""
         metrics = self.get_financial_data().get("key_metrics", {})
         revenue = metrics.get("total_revenue")
         
@@ -428,6 +359,5 @@ class DataFetcher:
         
         try:
             return float(revenue) < threshold
-        except (TypeError, ValueError):
+        except:
             return True
-
