@@ -8,19 +8,8 @@ Includes error handling and data formatting for downstream use.
 import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Tuple
-import json
+from typing import Optional, Dict, Any
 import requests
-
-
-# Fix for Streamlit Cloud - set headers to avoid blocking
-yf.pdr_override()
-
-# Monkey-patch to add headers (helps avoid Yahoo blocking cloud IPs)
-import yfinance.data as _yf_data
-_yf_data.YfData.user_agent_headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-}
 
 
 class DataFetcher:
@@ -57,18 +46,16 @@ class DataFetcher:
             try:
                 self._info = self.stock.info
                 # Check if we got valid data
-                if not self._info or self._info.get('regularMarketPrice') is None:
-                    # Try a backup approach
+                if not self._info or len(self._info) < 5:
                     self._info = self._fetch_info_backup()
             except Exception as e:
                 print(f"Error fetching stock info: {e}")
-                self._info = {"error": str(e)}
+                self._info = {"error": str(e), "symbol": self.ticker}
         return self._info
 
     def _fetch_info_backup(self) -> Dict[str, Any]:
         """Backup method to fetch basic info if main method fails."""
         try:
-            # Try to at least get price data
             hist = self.stock.history(period="5d")
             if not hist.empty:
                 return {
@@ -78,7 +65,7 @@ class DataFetcher:
                 }
         except:
             pass
-        return {"error": "Could not fetch stock info"}
+        return {"error": "Could not fetch stock info", "symbol": self.ticker}
 
     def get_price_history(
         self, period: str = "1y", interval: str = "1d"
@@ -95,18 +82,18 @@ class DataFetcher:
         """
         if self._history is None or self._history.empty:
             try:
-                # Method 1: Standard approach
-                self._history = self.stock.history(period=period, interval=interval)
+                # Try download method first (more reliable on cloud)
+                self._history = yf.download(
+                    self.ticker, 
+                    period=period, 
+                    interval=interval,
+                    progress=False,
+                    auto_adjust=True
+                )
                 
-                # If empty, try download method
+                # If empty, try the Ticker.history method
                 if self._history.empty:
-                    self._history = yf.download(
-                        self.ticker, 
-                        period=period, 
-                        interval=interval,
-                        progress=False,
-                        auto_adjust=True
-                    )
+                    self._history = self.stock.history(period=period, interval=interval)
                 
                 # Reset index to make Date a column
                 if not self._history.empty:
@@ -186,7 +173,6 @@ class DataFetcher:
             try:
                 income_stmt = self.stock.income_stmt
                 if income_stmt is not None and not income_stmt.empty:
-                    # Get most recent year's data
                     latest = income_stmt.iloc[:, 0]
                     financials["income_statement"] = {
                         "total_revenue": self._safe_get(latest, "Total Revenue"),
@@ -195,7 +181,6 @@ class DataFetcher:
                         "net_income": self._safe_get(latest, "Net Income"),
                         "ebitda": self._safe_get(latest, "EBITDA"),
                     }
-                    # Get historical for trends
                     financials["income_statement"]["historical_revenue"] = self._get_historical_series(
                         income_stmt, "Total Revenue"
                     )
@@ -265,12 +250,7 @@ class DataFetcher:
         return result
 
     def format_financial_data_for_llm(self) -> str:
-        """
-        Format financial data as a string for LLM consumption.
-        
-        Returns:
-            Formatted string with key financial metrics
-        """
+        """Format financial data as a string for LLM consumption."""
         data = self.get_financial_data()
         info = self.get_stock_info()
         
@@ -362,82 +342,21 @@ class DataFetcher:
             f"Payout Ratio: {fmt_pct(metrics.get('payout_ratio'))}",
         ])
 
-        # Add income statement details if available
-        income = data.get("income_statement", {})
-        if income and "error" not in income:
-            lines.extend([
-                "",
-                "=== INCOME STATEMENT (Most Recent) ===",
-                f"Total Revenue: {fmt_num(income.get('total_revenue'), prefix='$')}",
-                f"Gross Profit: {fmt_num(income.get('gross_profit'), prefix='$')}",
-                f"Operating Income: {fmt_num(income.get('operating_income'), prefix='$')}",
-                f"Net Income: {fmt_num(income.get('net_income'), prefix='$')}",
-                f"EBITDA: {fmt_num(income.get('ebitda'), prefix='$')}",
-            ])
-            
-            # Historical revenue if available
-            hist_rev = income.get("historical_revenue", {})
-            if hist_rev:
-                lines.append("")
-                lines.append("Historical Revenue:")
-                for date, value in sorted(hist_rev.items(), reverse=True)[:4]:
-                    lines.append(f"  {date}: {fmt_num(value, prefix='$')}")
-
-        # Add balance sheet details if available
-        balance = data.get("balance_sheet", {})
-        if balance and "error" not in balance:
-            lines.extend([
-                "",
-                "=== BALANCE SHEET (Most Recent) ===",
-                f"Total Assets: {fmt_num(balance.get('total_assets'), prefix='$')}",
-                f"Total Liabilities: {fmt_num(balance.get('total_liabilities'), prefix='$')}",
-                f"Stockholders Equity: {fmt_num(balance.get('total_equity'), prefix='$')}",
-                f"Current Assets: {fmt_num(balance.get('current_assets'), prefix='$')}",
-                f"Current Liabilities: {fmt_num(balance.get('current_liabilities'), prefix='$')}",
-                f"Cash & Equivalents: {fmt_num(balance.get('cash_and_equivalents'), prefix='$')}",
-                f"Long-term Debt: {fmt_num(balance.get('long_term_debt'), prefix='$')}",
-            ])
-
-        # Add cash flow details if available
-        cf = data.get("cash_flow", {})
-        if cf and "error" not in cf:
-            lines.extend([
-                "",
-                "=== CASH FLOW (Most Recent) ===",
-                f"Operating Cash Flow: {fmt_num(cf.get('operating_cash_flow'), prefix='$')}",
-                f"Capital Expenditure: {fmt_num(cf.get('capital_expenditure'), prefix='$')}",
-                f"Free Cash Flow: {fmt_num(cf.get('free_cash_flow'), prefix='$')}",
-                f"Dividends Paid: {fmt_num(cf.get('dividends_paid'), prefix='$')}",
-            ])
-
         return "\n".join(lines)
 
-    def format_price_data_for_llm(self, days: int = 90) -> str:
-        """
-        Format recent price/volume data for LLM technical analysis.
-        
-        Args:
-            days: Number of trading days to include (default 90 ~= 4 months)
-            
-        Returns:
-            Formatted string with price and volume data
-        """
+    def format_price_data_for_llm(self, days: int = 60) -> str:
+        """Format recent price/volume data for LLM technical analysis."""
         df = self.get_price_history()
         
         if df.empty:
             return "Price data unavailable."
         
-        # Get recent data
+        # Calculate moving averages
+        df["MA50"] = df["Close"].rolling(window=50).mean()
+        df["MA200"] = df["Close"].rolling(window=200).mean()
+        df["Avg_Volume"] = df["Volume"].rolling(window=50).mean()
+        
         recent = df.tail(days).copy()
-        
-        # Calculate moving averages on full dataset first
-        df_full = self.get_price_history()
-        df_full["MA50"] = df_full["Close"].rolling(window=50).mean()
-        df_full["MA200"] = df_full["Close"].rolling(window=200).mean()
-        df_full["Avg_Volume"] = df_full["Volume"].rolling(window=50).mean()
-        
-        # Get recent with MAs
-        recent = df_full.tail(days).copy()
         
         lines = [
             f"Price and Volume Data for {self.ticker}",
@@ -459,17 +378,12 @@ class DataFetcher:
                 f"Current Price: ${current_price:.2f}",
                 f"Previous Close: ${prev_close:.2f}",
                 f"Change: ${change:.2f} ({change_pct:+.2f}%)",
-                f"Day's High: ${latest['High']:.2f}",
-                f"Day's Low: ${latest['Low']:.2f}",
-                f"Volume: {int(latest['Volume']):,}",
-                f"50-Day Average Volume: {int(latest['Avg_Volume']):,}" if pd.notna(latest.get('Avg_Volume')) else "",
                 "",
                 "=== MOVING AVERAGES ===",
-                f"50-Day MA: ${latest['MA50']:.2f}" if pd.notna(latest.get('MA50')) else "50-Day MA: N/A (insufficient data)",
-                f"200-Day MA: ${latest['MA200']:.2f}" if pd.notna(latest.get('MA200')) else "200-Day MA: N/A (insufficient data)",
+                f"50-Day MA: ${latest['MA50']:.2f}" if pd.notna(latest.get('MA50')) else "50-Day MA: N/A",
+                f"200-Day MA: ${latest['MA200']:.2f}" if pd.notna(latest.get('MA200')) else "200-Day MA: N/A",
             ])
             
-            # Position relative to MAs
             if pd.notna(latest.get('MA50')):
                 pct_from_50 = ((current_price - latest['MA50']) / latest['MA50']) * 100
                 lines.append(f"Price vs 50-MA: {pct_from_50:+.2f}%")
@@ -477,29 +391,22 @@ class DataFetcher:
                 pct_from_200 = ((current_price - latest['MA200']) / latest['MA200']) * 100
                 lines.append(f"Price vs 200-MA: {pct_from_200:+.2f}%")
         
-        # Calculate period statistics
         lines.extend([
             "",
             "=== PERIOD STATISTICS ===",
             f"Period High: ${recent['High'].max():.2f}",
             f"Period Low: ${recent['Low'].min():.2f}",
-            f"Average Close: ${recent['Close'].mean():.2f}",
             f"Average Volume: {int(recent['Volume'].mean()):,}",
         ])
         
-        # Recent price action summary (last 20 days)
+        # Last 20 days summary
         last_20 = recent.tail(20)
         if len(last_20) >= 2:
             start_price = last_20.iloc[0]["Close"]
             end_price = last_20.iloc[-1]["Close"]
             period_return = ((end_price - start_price) / start_price) * 100
-            
             up_days = (last_20["Close"].diff() > 0).sum()
             down_days = (last_20["Close"].diff() < 0).sum()
-            
-            avg_vol = last_20["Volume"].mean()
-            up_day_vol = last_20[last_20["Close"].diff() > 0]["Volume"].mean()
-            down_day_vol = last_20[last_20["Close"].diff() < 0]["Volume"].mean()
             
             lines.extend([
                 "",
@@ -507,45 +414,12 @@ class DataFetcher:
                 f"Return: {period_return:+.2f}%",
                 f"Up Days: {up_days}",
                 f"Down Days: {down_days}",
-                f"Avg Volume on Up Days: {int(up_day_vol):,}" if pd.notna(up_day_vol) else "Avg Volume on Up Days: N/A",
-                f"Avg Volume on Down Days: {int(down_day_vol):,}" if pd.notna(down_day_vol) else "Avg Volume on Down Days: N/A",
             ])
-        
-        # Daily data summary (last 10 days)
-        lines.extend([
-            "",
-            "=== RECENT DAILY DATA (Last 10 Days) ===",
-            "Date | Open | High | Low | Close | Volume | Change%"
-        ])
-        
-        last_10 = recent.tail(10)
-        for i, (_, row) in enumerate(last_10.iterrows()):
-            date_str = row["Date"].strftime("%Y-%m-%d") if hasattr(row["Date"], "strftime") else str(row["Date"])[:10]
-            
-            # Calculate daily change
-            if i > 0:
-                prev_close = last_10.iloc[i-1]["Close"]
-                daily_change = ((row["Close"] - prev_close) / prev_close) * 100
-            else:
-                daily_change = 0
-            
-            lines.append(
-                f"{date_str} | ${row['Open']:.2f} | ${row['High']:.2f} | "
-                f"${row['Low']:.2f} | ${row['Close']:.2f} | {int(row['Volume']):,} | {daily_change:+.2f}%"
-            )
         
         return "\n".join(lines)
 
     def is_pre_revenue(self, threshold: float = 1_000_000) -> bool:
-        """
-        Check if company is pre-revenue or early-stage.
-        
-        Args:
-            threshold: Revenue threshold below which company is considered pre-revenue
-            
-        Returns:
-            True if company appears to be pre-revenue
-        """
+        """Check if company is pre-revenue or early-stage."""
         metrics = self.get_financial_data().get("key_metrics", {})
         revenue = metrics.get("total_revenue")
         
@@ -556,4 +430,3 @@ class DataFetcher:
             return float(revenue) < threshold
         except (TypeError, ValueError):
             return True
-
