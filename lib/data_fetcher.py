@@ -430,3 +430,4 @@ class DataFetcher:
             return float(revenue) < threshold
         except (TypeError, ValueError):
             return True
+
